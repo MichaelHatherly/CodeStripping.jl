@@ -1,6 +1,5 @@
 module CodeStripping
 
-import Base.Filesystem
 import Pkg
 
 # Interface.
@@ -13,7 +12,7 @@ export strip_code
 Remove source code from the provided `target` where `target` can
 be any of the following:
 
-  - `String`, directory or source file
+  - `String`, project directory
   - `Module` object
   - `Symbol`, name of a package
   - a `Vector` of any of the above
@@ -25,30 +24,27 @@ perform the lookup in instead.
 """
 function strip_code end
 
-function strip_code(path::AbstractString)
-    if isdir(path)
-        for each in ("JuliaProject.toml", "Project.toml")
-            toml = joinpath(path, each)
-            if isfile(toml)
-                strip_code(toml)
-            end
-        end
-        error("`$path` is not a valid project directory.")
+function strip_code(pkg::Base.PkgId)
+    with_mtime_adjustment(pkg) do path
+        name, = splitext(basename(path))
+        write(
+            path,
+            """
+            # Code stripped.
+            module $name end
+            """
+        )
+    end
+end
+strip_code(mod::Module) = strip_code(Base.PkgId(mod))
+
+function strip_code(directory::AbstractString)
+    if isdir(directory)
+        ctx = create_pkg_context(directory)
+        package = Symbol(ctx.env.pkg.name)
+        return strip_code(package, directory)
     else
-        if isfile(path)
-            _, ext = splitext(path)
-            if ext == ".jl"
-                _preserve_mtime(_strip_code, path)
-            elseif ext == ".toml"
-                ctx = create_pkg_context(dirname(path))
-                package = Symbol(ctx.env.pkg.name)
-                return strip_code(package, dirname(path))
-            else
-                error("unsupported file type `$path`, only .jl and .toml files are supported.")
-            end
-        else
-            error("unsupported path `$path`, only files and directories are supported.")
-        end
+        error("`$directory` is not a directory.")
     end
 end
 
@@ -77,23 +73,9 @@ function strip_code(v::Vector{Symbol}, project=dirname(Base.active_project()))
 end
 
 strip_code(mod::Module) = strip_code(Base.PkgId(_root_module(mod)))
-strip_code(pkgid::Base.PkgId) = strip_code(_included_files(pkgid))
 strip_code(v::Vector) = foreach(strip_code, v)
 
 # Internals.
-
-const STRIPPED_SOURCE_COMMENT = "# Source code for this file has been stripped."
-function _strip_code(file::AbstractString)
-    open(file, "w") do io
-        println(io, STRIPPED_SOURCE_COMMENT)
-        # Always add a "stub" module to the file matching it's file name
-        # so that the root file of a package is loadable by `julia`, but
-        # just results in an empty module object.
-        name, = splitext(basename(file))
-        println(io, "module $name end")
-    end
-    @debug "stripped source code" file
-end
 
 function _root_module(mod::Module)
     if mod in (Base, Core)
@@ -108,38 +90,38 @@ function _root_module(mod::Module)
     end
 end
 
-function _included_files(pkgid::Base.PkgId)
-    cachefile = _most_recent_cache_file(pkgid)
-    open(cachefile, "r") do io
-        if !Base.isvalid_cache_header(io)
-            error("Rejecting cache file $cachefile due to it containing an invalid cache header.")
+function with_mtime_adjustment(func, pkg::Base.PkgId)
+    ji_file = Base.compilecache(pkg)
+    raw_bytes = read(ji_file)
+    _, (includes, _), _, _, _ = Base.parse_cache_header(ji_file)
+
+    for each in includes
+        filename = each.filename
+        old_mtime = each.mtime
+
+        buffer = IOBuffer()
+        write(buffer, filename, old_mtime)
+        target_bytes = take!(buffer)
+
+        target_range = findfirst(target_bytes, raw_bytes)
+
+        if isnothing(target_range)
+            error("could not find `$filename` in cache header")
+        else
+            func(filename)
+            new_mtime = mtime(filename)
+
+            buffer = IOBuffer()
+            write(buffer, filename, new_mtime)
+            new_bytes = take!(buffer)
+
+            raw_bytes[target_range] = new_bytes
         end
-        _, (includes, _), _, _, _, _ = Base.parse_cache_header(io)
-        return [each.filename for each in includes]
     end
+    raw_bytes_no_crc = raw_bytes[1:end-4]
+    write(ji_file, raw_bytes_no_crc, Base._crc32c(raw_bytes_no_crc))
 end
-
-function _most_recent_cache_file(pkgid::Base.PkgId)
-    ji_files = Base.find_all_in_cache_path(pkgid)
-    if isempty(ji_files)
-        error("could not find any ji files for `$pkgid`.")
-    else
-        sort!(ji_files; by=mtime, rev=true)
-        return first(ji_files)
-    end
-end
-
-function _preserve_mtime(func::Function, path::AbstractString)
-    original_mtime = Base.mtime(path)
-    result = func(path)
-    file_handle = Filesystem.open(path, Filesystem.JL_O_WRONLY | Filesystem.JL_O_CREAT, 0o0666)
-    try
-        Filesystem.futime(file_handle, original_mtime, original_mtime)
-    finally
-        Filesystem.close(file_handle)
-    end
-    return result
-end
+with_mtime_adjustment(func, mod::Module) = with_mtime_adjustment(func, Base.PkgId(mod))
 
 # From PackageCompiler.
 function create_pkg_context(project)
@@ -149,7 +131,5 @@ function create_pkg_context(project)
     end
     return Pkg.Types.Context(env=Pkg.Types.EnvCache(project_toml_path))
 end
-
-include("test.jl")
 
 end

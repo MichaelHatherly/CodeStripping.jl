@@ -1,76 +1,74 @@
 using CodeStripping
-using Logging
-using Pkg
 using Test
 
-function check_for_stale_cache_files(mod::Module)
-    pkg_id = Base.PkgId(mod)
-    pkg_root = joinpath(pkgdir(mod), "src", "CodeStripping.jl")
-    results = Bool[]
-    for each in Base.find_all_in_cache_path(pkg_id)
-        result = Base.stale_cachefile(pkg_root, each)
-        isa(result, Vector) && push!(results, mod in result)
-    end
-    return isempty(results) ? false : all((==)(false), results)
-end
-
 @testset "CodeStripping" begin
-    @testset "Internals" begin
-        t = mtime(@__FILE__)
-        CodeStripping._preserve_mtime(@__FILE__) do path
-            touch(path)
-        end
-        @test t ≈ mtime(@__FILE__) # Last digit seems to change when using `futime`.
+    mktempdir() do tmp
+        pushfirst!(LOAD_PATH, joinpath(tmp, "Project.toml"))
+        try
+            name = "TestPackage"
+            uuid = "a2de5692-967f-a7db-685c-be5db730c223"
+            write(joinpath(tmp, "Project.toml"),
+                """
+                name = "$name"
+                uuid = "$uuid"
+                version = "0.1.0"
+                """)
 
-        # Check whether there is a usable ji file, then touch
-        # a file that should cause a cache invalidation and recheck,
-        # once with our preserve_mtimes wrapper and then once without.
-        test_file = joinpath(@__DIR__, "..", "src", "test.jl")
+            write(joinpath(tmp, "Manifest.toml"),
+                """
+                julia_version = "$VERSION"
+                manifest_format = "2.0"
+                """)
 
-        @test check_for_stale_cache_files(CodeStripping)
+            mkdir(joinpath(tmp, "src"))
 
-        CodeStripping._preserve_mtime(test_file) do path
-            touch(path)
-        end
-        @test check_for_stale_cache_files(CodeStripping)
+            source_file = joinpath(tmp, "src", "$name.jl")
+            write(source_file,
+                """
+                module $name
 
-        touch(test_file)
-        @test !check_for_stale_cache_files(CodeStripping)
-    end
-    @testset "Code stripping" begin
-        mktempdir() do dir
-            pkg_name = "TempPackage"
-            cd(dir) do
-                Pkg.generate(pkg_name; io=IOBuffer())
-            end
-            pkg_path = joinpath(dir, pkg_name)
-            @test isdir(pkg_path)
+                # Contents goes here.
 
-            # First ensure that the package is usable, it has a function called `greet`.
-            cmd = `$(Base.julia_cmd()) --project=$(pkg_path) -e 'using TempPackage; TempPackage.greet()'`
-            @test success(cmd)
+                end
+                """)
 
-            # Then strip out the source code.
-            @test_logs(
-                (:debug, "stripped source code"),
-                min_level = Logging.Debug,
-                CodeStripping.strip_code(:TempPackage, pkg_path)
-            )
+            pkg_id = Base.PkgId(Base.UUID(uuid), name)
 
-            source_file = joinpath(pkg_path, "src", "$pkg_name.jl")
+            ji_file = Base.compilecache(pkg_id)
 
-            @test !contains(read(source_file, String), "greet()")
-            @test contains(read(source_file, String), CodeStripping.STRIPPED_SOURCE_COMMENT)
-            @test contains(read(source_file, String), "module $pkg_name end")
+            @test contains(read(source_file, String), "# Contents goes here.")
+            @test !contains(read(source_file, String), "# Code stripped.")
+            @test !contains(read(source_file, String), "module $name end")
 
-            # Check whether we can still call the greet function, since the cache file should
-            # not be classed as stale and we should be able to load `greet` directly from it.
-            @test success(cmd)
+            @test Base.stale_cachefile(source_file, ji_file) isa Vector
 
-            # Next, we adjust the mtime of the source file so cause a recompilation and check
-            # whether we can now not call the greet function, since it shouldn't exist any more.
-            touch(source_file)
-            @test !success(cmd)
+            sleep(1)
+
+            CodeStripping.strip_code(pkg_id)
+
+            sleep(1)
+
+            @test Base.stale_cachefile(source_file, ji_file) isa Vector
+
+            @test !contains(read(source_file, String), "# Contents goes here.")
+            @test contains(read(source_file, String), "# Code stripped.")
+            @test contains(read(source_file, String), "module $name end")
+
+            # Wait a bit before writing a change that should be registered.
+            sleep(1)
+
+            write(source_file,
+                """
+                module $name
+
+                # New contents goes here.
+
+                end
+                """)
+
+            @test Base.stale_cachefile(source_file, ji_file)
+        finally
+            popfirst!(LOAD_PATH)
         end
     end
 end
