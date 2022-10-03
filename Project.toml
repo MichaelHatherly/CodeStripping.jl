@@ -1,0 +1,10 @@
+name = "CodeStripping"
+uuid = "df25a5cc-cc1e-4372-8fd8-c7e3005b4a9a"
+authors = ["Mike <michaelhatherly@gmail.com>"]
+version = "0.1.0"
+
+[deps]
+Pkg = "44cfe95a-1eb2-52ea-b672-e2afdf69b78f"
+
+[compat]
+julia = "1.6"
