@@ -40,7 +40,7 @@ jobs:
           path: ~/.julia
           key: ${{ matrix.os }}-${{ matrix.version }}-${{ matrix.arch }}-${{ hashFiles('**/Project.toml') }}
 
-      - uses: julia-actions/setup-julia@v1
+      - uses: julia-actions/setup-julia@v2
         with:
           version: ${{ matrix.version }}
           arch: ${{ matrix.arch }}
